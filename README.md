@@ -1,5 +1,8 @@
 # JARVIS — Advanced AI Virtual Assistant
 
+<img width="2926" height="1672" alt="image" src="https://github.com/user-attachments/assets/7b39c08f-5014-403c-a2a1-bc61a91a0d51" />
+
+
 JARVIS is a futuristic, highly capable virtual assistant built with Electron and Python. It features a stunning "Stark Industries" HUD interface and leverages a multi-LLM architecture to provide real-time intelligence, system control, and automation.
 
 ## 🚀 System Architecture
