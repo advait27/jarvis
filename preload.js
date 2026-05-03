@@ -13,6 +13,22 @@ contextBridge.exposeInMainWorld('assistant', {
   // Sarvam Text-to-Speech
   sarvamTTS: (text) => ipcRenderer.invoke('sarvam-tts', text),
 
+  // NIM (NVIDIA build) — primary brain, vision, health-check
+  nimChat: (payload) => ipcRenderer.invoke('nim-chat', payload),
+  nimVision: (payload) => ipcRenderer.invoke('nim-vision', payload),
+  nimAudio: (payload) => ipcRenderer.invoke('nim-audio', payload),
+  nimPing: () => ipcRenderer.invoke('nim-ping'),
+
+  // Sensory capture
+  captureScreen: (opts) => ipcRenderer.invoke('capture-screen', opts || {}),
+  listScreenSources: () => ipcRenderer.invoke('list-screen-sources'),
+
+  // Sensory memory
+  memoryAdd: (payload) => ipcRenderer.invoke('memory-add', payload),
+  memoryQuery: (payload) => ipcRenderer.invoke('memory-query', payload),
+  memoryStats: () => ipcRenderer.invoke('memory-stats'),
+  memoryClear: () => ipcRenderer.invoke('memory-clear'),
+
   // Groq Chat Completions
   groqChat: (messages) => ipcRenderer.invoke('groq-chat', messages),
 

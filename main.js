@@ -1,13 +1,16 @@
 require('dotenv').config();
-const { app, BrowserWindow, ipcMain, systemPreferences, session, shell, protocol, net } = require('electron');
+const { app, BrowserWindow, ipcMain, systemPreferences, session, shell, protocol, net, desktopCapturer, screen } = require('electron');
 const path = require('path');
 const { exec } = require('child_process');
 const os = require('os');
 const fs = require('fs');
 const Groq = require('groq-sdk');
+const nim = require('./nim_client');
+const memory = require('./memory_store');
 
 console.log("[Main] JARVIS Core Initializing...");
-console.log(`[Main] Environment: SARVAM_KEY=${process.env.SARVAM_API_KEY ? 'Present' : 'Missing'}, GROQ_KEY=${process.env.GROQ_API_KEY ? 'Present' : 'Missing'}, OPENROUTER_KEY=${process.env.OPENROUTER_API_KEY ? 'Present' : 'Missing'}`);
+console.log(`[Main] Environment: NVIDIA_KEY=${process.env.NVIDIA_API_KEY ? 'Present' : 'Missing'}, SARVAM_KEY=${process.env.SARVAM_API_KEY ? 'Present' : 'Missing'}, GROQ_KEY=${process.env.GROQ_API_KEY ? 'Present' : 'Missing'}, OPENROUTER_KEY=${process.env.OPENROUTER_API_KEY ? 'Present' : 'Missing'}`);
+console.log(`[NIM] Defaults — reasoning=${nim.DEFAULTS.reasoning} | vision=${nim.DEFAULTS.vision} | omni=${nim.DEFAULTS.omni}`);
 
 // ── Groq API Key Rotation Pool ───────────────────────────────────────────
 const GROQ_KEYS = [
@@ -17,14 +20,16 @@ const GROQ_KEYS = [
 ].filter(Boolean); // Remove undefined/empty keys
 
 let currentKeyIndex = 0;
-let groq = new Groq({ apiKey: GROQ_KEYS[currentKeyIndex] });
+let groq = GROQ_KEYS.length ? new Groq({ apiKey: GROQ_KEYS[currentKeyIndex] }) : null;
 
-console.log(`[Groq] Key pool initialized with ${GROQ_KEYS.length} key(s). Active: Key #${currentKeyIndex + 1}`);
+if (groq) console.log(`[Groq] Key pool initialized with ${GROQ_KEYS.length} key(s). Active: Key #${currentKeyIndex + 1}`);
+else console.log('[Groq] No GROQ_API_KEY set — Groq STT/TTS/chat handlers will return errors. Using NIM as primary brain.');
 
 /**
  * Rotates to the next Groq API key. Returns true if rotated, false if all keys exhausted.
  */
 function rotateGroqKey(reason) {
+  if (!GROQ_KEYS.length) return false;
   currentKeyIndex = (currentKeyIndex + 1) % GROQ_KEYS.length;
   groq = new Groq({ apiKey: GROQ_KEYS[currentKeyIndex] });
   console.log(`[Groq] 🔄 Rotated to Key #${currentKeyIndex + 1} (Reason: ${reason})`);
@@ -160,6 +165,12 @@ function createWindow() {
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
   await setupMCP();
+  try {
+    const info = memory.init(app.getPath('userData'));
+    console.log(`[Memory] ✅ ${info.count} prior entries loaded — ${info.file}`);
+  } catch (err) {
+    console.error('[Memory] init failed:', err.message);
+  }
   console.log(`[Main] Platform detected: ${process.platform}`);
 
   if (process.platform === 'darwin') {
@@ -546,6 +557,118 @@ ipcMain.handle('mcp-tool', async (event, toolName, args) => {
     return { success: true, content };
   } catch (err) {
     console.error(`[MCP] Tool call error: ${err.message}`);
+    return { success: false, error: err.message };
+  }
+});
+
+// ── NIM Chat Handler (NVIDIA build — primary brain) ──────────────────────
+let nimChatAbort = null;
+ipcMain.handle('nim-chat', async (event, { messages, max_tokens, temperature } = {}) => {
+  if (nimChatAbort) { try { nimChatAbort.abort(); } catch (_) {} }
+  const controller = new AbortController();
+  nimChatAbort = controller;
+  try {
+    const result = await nim.chat({ messages, max_tokens, temperature, signal: controller.signal });
+    nimChatAbort = null;
+    console.log(`[NIM Chat] ✅ ${result.model} ${result.latencyMs}ms (${result.reply.length} chars)`);
+    return result;
+  } catch (err) {
+    nimChatAbort = null;
+    if (err.name === 'AbortError') return { success: false, error: 'ABORTED' };
+    console.error('[NIM Chat] Error:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('nim-vision', async (event, { prompt, imageDataUrl, history, max_tokens } = {}) => {
+  try {
+    const result = await nim.vision({ prompt, imageDataUrl, history, max_tokens });
+    console.log(`[NIM Vision] ✅ ${result.model} ${result.latencyMs}ms`);
+    return result;
+  } catch (err) {
+    console.error('[NIM Vision] Error:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('nim-audio', async (event, { prompt, audioBase64, format, history, max_tokens } = {}) => {
+  try {
+    const result = await nim.audio({ prompt, audioBase64, format, history, max_tokens });
+    console.log(`[NIM Audio] ✅ ${result.model} ${result.latencyMs}ms — ${result.reply.substring(0, 80)}`);
+    return result;
+  } catch (err) {
+    console.error('[NIM Audio] Error:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('nim-ping', async () => nim.ping());
+
+// ── Sensory Memory (Phase 4) ─────────────────────────────────────────────
+ipcMain.handle('memory-add', async (event, payload) => {
+  try { return await memory.add(payload || {}); }
+  catch (err) { console.error('[Memory add]', err.message); return { success: false, error: err.message }; }
+});
+ipcMain.handle('memory-query', async (event, payload) => {
+  try {
+    const res = await memory.query(payload || {});
+    if (res.success) console.log(`[Memory query] "${(payload?.query || '').slice(0, 50)}" → ${res.hits.length}/${res.candidates} hits`);
+    return res;
+  } catch (err) { console.error('[Memory query]', err.message); return { success: false, error: err.message }; }
+});
+ipcMain.handle('memory-stats', async () => memory.stats());
+ipcMain.handle('memory-clear', async () => memory.clear());
+
+// ── Screen Capture (desktopCapturer thumbnail → data URL) ───────────────
+// Returns a single JPEG data URL of the primary display, sized for VL models
+// (high enough resolution to read text, low enough to keep payload small).
+ipcMain.handle('capture-screen', async (event, { displayIndex = 0, maxWidth = 1280 } = {}) => {
+  try {
+    const displays = screen.getAllDisplays();
+    const target = displays[Math.min(displayIndex, displays.length - 1)] || displays[0];
+    const { width, height } = target.size;
+    const aspectH = Math.round(height * (maxWidth / width));
+
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: maxWidth, height: aspectH },
+    });
+    if (!sources.length) throw new Error('No screen sources available');
+
+    // Match by display_id when possible; otherwise fall back to first source.
+    const source = sources.find(s => String(s.display_id) === String(target.id)) || sources[displayIndex] || sources[0];
+    const dataUrl = source.thumbnail.toDataURL('image/jpeg', 0.85);
+    return {
+      success: true,
+      dataUrl,
+      sourceName: source.name,
+      width: maxWidth,
+      height: aspectH,
+      bytes: dataUrl.length,
+    };
+  } catch (err) {
+    console.error('[Capture Screen] Error:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
+// Returns the available screen sources (so renderer can let user pick).
+ipcMain.handle('list-screen-sources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 320, height: 180 },
+    });
+    return {
+      success: true,
+      sources: sources.map(s => ({
+        id: s.id,
+        name: s.name,
+        display_id: s.display_id,
+        thumbnail: s.thumbnail.toDataURL('image/jpeg', 0.6),
+      })),
+    };
+  } catch (err) {
     return { success: false, error: err.message };
   }
 });

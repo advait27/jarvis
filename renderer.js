@@ -1086,6 +1086,67 @@ function tryLocalResponse(text) {
 
   return null; // No local match — pass to API
 }
+// ── Voice configuration ──
+// Preferred voices in priority order. First matching name wins; falls back to en-GB
+// then en-US. To swap voice, change the first entry or call window.jarvisVoice.set("Reed").
+const PREFERRED_VOICES = [
+  'Daniel',                // British male — Jarvis default
+  'Daniel (English (United Kingdom))',
+  'Reed (English (UK))',   // Modern British male
+  'Oliver',
+  'Microsoft George',
+  'Samantha',              // Last resort (US Siri-style female)
+];
+let _cachedVoiceList = null;
+let _selectedVoice = null;
+
+// Wait for Web Speech voices to load (they populate async on macOS).
+function _ensureVoicesLoaded() {
+  return new Promise((resolve) => {
+    let voices = window.speechSynthesis.getVoices();
+    if (voices.length) return resolve(voices);
+    const t0 = Date.now();
+    const tick = () => {
+      voices = window.speechSynthesis.getVoices();
+      if (voices.length || Date.now() - t0 > 1500) return resolve(voices);
+      setTimeout(tick, 80);
+    };
+    window.speechSynthesis.addEventListener('voiceschanged', () => resolve(window.speechSynthesis.getVoices()), { once: true });
+    tick();
+  });
+}
+
+async function pickVoice() {
+  if (_selectedVoice) return _selectedVoice;
+  const voices = await _ensureVoicesLoaded();
+  _cachedVoiceList = voices;
+  for (const want of PREFERRED_VOICES) {
+    const found = voices.find(v => v.name === want) || voices.find(v => v.name.startsWith(want));
+    if (found) { _selectedVoice = found; break; }
+  }
+  if (!_selectedVoice) {
+    _selectedVoice = voices.find(v => v.lang === 'en-GB' || v.lang.startsWith('en-GB'))
+                  || voices.find(v => v.lang.startsWith('en-US'))
+                  || voices[0] || null;
+  }
+  console.log(`[TTS] Voice selected: ${_selectedVoice?.name || 'system default'} (${_selectedVoice?.lang || '?'}) — out of ${voices.length} voices`);
+  return _selectedVoice;
+}
+
+// Allow runtime swap from the dev console: jarvisVoice.set("Reed")
+window.jarvisVoice = {
+  list: () => (_cachedVoiceList || window.speechSynthesis.getVoices()).map(v => `${v.name} (${v.lang})`),
+  set: (nameFragment) => {
+    const voices = window.speechSynthesis.getVoices();
+    const found = voices.find(v => v.name === nameFragment) || voices.find(v => v.name.includes(nameFragment));
+    if (!found) return `No voice matching "${nameFragment}". Available: ${voices.length}`;
+    _selectedVoice = found;
+    console.log(`[TTS] Voice manually set to: ${found.name}`);
+    return `Voice now: ${found.name} (${found.lang})`;
+  },
+  current: () => _selectedVoice ? `${_selectedVoice.name} (${_selectedVoice.lang})` : '(none yet)',
+};
+
 // ── Filler Responses ──
 const FILLER_PHRASES = [
   "Just a moment, sir.",
@@ -1110,13 +1171,10 @@ async function speakFiller(text) {
   window.lastSpokenText = text;
   window.speechSynthesis.cancel();
   const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = 0.95;
-  utt.pitch = 0.85;
+  utt.rate = 1.0;
+  utt.pitch = 1.0;
 
-  const voices = window.speechSynthesis.getVoices();
-  const v = voices.find(x => x.name.includes('Daniel') || x.name.includes('Microsoft George') || x.name.includes('Samantha'))
-    || voices.find(x => x.lang.startsWith('en-GB'))
-    || voices.find(x => x.lang.startsWith('en-US'));
+  const v = await pickVoice();
   if (v) utt.voice = v;
 
   utt.onstart = () => { isSpeaking = true; };
@@ -1126,15 +1184,493 @@ async function speakFiller(text) {
   window.speechSynthesis.speak(utt);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// VISION SUBSYSTEM (Phase 2 — Sensory Expansion)
+// ═══════════════════════════════════════════════════════════════════════════
+let _cameraStream = null;
+let _screenWatchTimer = null;
+let _screenWatchLastSummary = null;
+
+// Pattern → "screen" / "camera" / "ambient" / "control" / null.
+function detectVisionIntent(text) {
+  const t = text.toLowerCase().trim();
+
+  // Ambient listening toggles + one-shot
+  if (/\b(start|begin|enable)\b.*(listen(?:ing)?|hear|ambient).*(surround|environment|room|world)/.test(t)
+      || /\b(start|begin|enable)\s+ambient\b/.test(t)
+      || /\b(listen to (?:my|the) (?:surroundings|environment|room))\b/.test(t)) {
+    return { source: 'control', op: 'ambient-start' };
+  }
+  if (/\b(stop|end|cancel|disable)\b.*(ambient|listening|hearing)/.test(t)
+      || /\bstop listening to (?:my|the) (?:surroundings|environment|room)\b/.test(t)) {
+    return { source: 'control', op: 'ambient-stop' };
+  }
+  if (/\bwhat do you hear\b|\bwhat can you hear\b|\blisten (?:right )?now\b|\bwhat'?s that (?:sound|noise)\b/.test(t)) {
+    return { source: 'ambient', op: 'one-shot' };
+  }
+
+  // Screen-watch toggles
+  if (/\b(start|begin)\b.*(watch|watching|monitor).*(screen|display)/.test(t)) return { source: 'control', op: 'watch-start' };
+  if (/\b(stop|end|cancel)\b.*(watch|watching|monitor)/.test(t)) return { source: 'control', op: 'watch-stop' };
+
+  // Camera intents
+  if (/\b(look at me|see me|how do i look|what do i look like|use the camera|turn on (the )?camera|check the camera)\b/.test(t)) {
+    return { source: 'camera', prompt: 'Briefly describe what you see in this camera image.' };
+  }
+
+  // Screen intents (broad — catches "what am I looking at", "what's on my screen", "read this", etc.)
+  if (/\b(what(?:'s| is)? on (my |the )?screen|what am i looking at|what do you see|describe (?:the )?screen|read (?:this|the screen|what's on)|look at (?:my )?screen|check (?:my )?screen|analyse|analyze) ?(the )?screen?\b/.test(t)
+      || /\bwhat does (this|that|the screen) say\b/.test(t)
+      || /\b(look at this|see this|describe this)\b/.test(t)) {
+    return { source: 'screen', prompt: extractVisionPrompt(text, 'Describe what is on the screen and what the user is currently doing. Keep it under three sentences.') };
+  }
+
+  return null;
+}
+
+// Lift any specific question out of the user's command, e.g.
+// "look at this and tell me what language this code is" → "what language this code is"
+function extractVisionPrompt(text, fallback) {
+  const m = text.match(/(?:and )?(?:tell me|explain|what|why|how|is|are|can|does|do|should)\b.*$/i);
+  return m ? m[0] : fallback;
+}
+
+async function captureCameraFrame() {
+  if (!_cameraStream) {
+    _cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  }
+  const video = document.createElement('video');
+  video.srcObject = _cameraStream;
+  video.muted = true;
+  await video.play();
+  // Give the camera a beat to expose properly.
+  await new Promise(r => setTimeout(r, 400));
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth || 1280;
+  canvas.height = video.videoHeight || 720;
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  video.pause();
+  video.srcObject = null;
+  return dataUrl;
+}
+
+function releaseCamera() {
+  if (_cameraStream) {
+    _cameraStream.getTracks().forEach(t => t.stop());
+    _cameraStream = null;
+  }
+}
+
+async function captureScreenFrame() {
+  const result = await window.assistant.captureScreen({ maxWidth: 1280 });
+  if (!result.success) throw new Error(result.error || 'Screen capture failed');
+  console.log(`[Vision] Captured screen "${result.sourceName}" (${result.width}x${result.height}, ${(result.bytes / 1024).toFixed(1)} KB)`);
+  return result.dataUrl;
+}
+
+// Run a vision query: capture frame, send to NIM VL, speak the response.
+async function runVisionQuery({ source, prompt, silent = false }) {
+  if (!silent) {
+    isProcessing = true;
+    ignoreAudio = true;
+    updateStatus('PROCESSING');
+    speakFiller(source === 'camera' ? 'Activating camera, sir.' : 'Examining your screen, sir.');
+  }
+
+  try {
+    const imageDataUrl = source === 'camera' ? await captureCameraFrame() : await captureScreenFrame();
+    const result = await window.assistant.nimVision({ prompt, imageDataUrl, max_tokens: 400 });
+
+    if (!result.success || !result.reply) {
+      throw new Error(result.error || 'NIM vision returned no reply');
+    }
+    console.log(`[Vision] ${result.model} ${result.latencyMs}ms: ${result.reply.substring(0, 120)}…`);
+    if (!silent) {
+      conversationHistory.push({ role: 'user', content: `[vision:${source}] ${prompt}` });
+      conversationHistory.push({ role: 'assistant', content: result.reply });
+      handleAIResponse(result.reply);
+    }
+    // Memory: store every vision observation (one-shot or screen-watch tick).
+    rememberAsync(silent ? 'screen-watch' : 'vision-query', `[${source}] ${result.reply}`, { source, prompt, silent });
+    return result.reply;
+  } catch (err) {
+    console.error('[Vision] Error:', err);
+    if (!silent) {
+      const msg = `My visual cortex appears to be malfunctioning, sir. ${err.message}`;
+      jarvisTextEl.textContent = msg;
+      speakTTS(msg);
+      finishSpeakingState();
+    }
+    throw err;
+  } finally {
+    if (source === 'camera') releaseCamera();
+  }
+}
+
+// Continuous screen-watch: every N seconds, summarize the screen and store it.
+// Only speak when the summary changes meaningfully.
+function startScreenWatch(intervalSec = 30) {
+  if (_screenWatchTimer) {
+    console.warn('[Vision] Screen watch already running.');
+    return false;
+  }
+  console.log(`[Vision] 👁  Screen-watch ON (every ${intervalSec}s)`);
+  const tick = async () => {
+    try {
+      const summary = await runVisionQuery({
+        source: 'screen',
+        prompt: 'In one sentence, describe what application and task the user is currently doing on this screen.',
+        silent: true,
+      });
+      if (summary && summary !== _screenWatchLastSummary) {
+        console.log(`[ScreenWatch] ${new Date().toLocaleTimeString()} — ${summary}`);
+        _screenWatchLastSummary = summary;
+      }
+    } catch (e) { /* swallow — keep the watch alive */ }
+  };
+  tick(); // immediate first tick
+  _screenWatchTimer = setInterval(tick, intervalSec * 1000);
+  return true;
+}
+
+function stopScreenWatch() {
+  if (!_screenWatchTimer) return false;
+  clearInterval(_screenWatchTimer);
+  _screenWatchTimer = null;
+  _screenWatchLastSummary = null;
+  console.log('[Vision] 👁  Screen-watch OFF');
+  return true;
+}
+
+// Expose to console + global for debug / future UI hooks
+window.jarvisVision = { runVisionQuery, startScreenWatch, stopScreenWatch, captureScreenFrame, captureCameraFrame };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AMBIENT AUDIO SUBSYSTEM (Phase 3 — sensory expansion: hearing the world)
+// ═══════════════════════════════════════════════════════════════════════════
+// Watches the existing mic stream for energy spikes that aren't user speech.
+// When a spike fires, captures ~3s of audio and asks Nemotron Omni to classify
+// the sound. If it's noteworthy (alarm, doorbell, cry, glass, dog, siren…),
+// JARVIS speaks an alert. Heavy background noise → "TRIVIAL" → silent.
+const AMBIENT = {
+  enabled: false,
+  baselineRms: 0,
+  baselineSamples: [],
+  baselineWindow: 30,         // rolling 30 samples (~7.5s at 250ms cadence)
+  spikeDelta: 22,             // jump above baseline (0–255 scale)
+  spikeFloor: 30,             // ignore anything below this absolute level
+  cooldownMs: 12000,          // don't fire alerts more often than this
+  recordingMs: 3000,          // length of captured chunk
+  lastAlertAt: 0,
+  busy: false,
+  pollHandle: null,
+  oneShotInflight: false,
+};
+
+const AMBIENT_NOTEWORTHY = /\b(alarm|siren|doorbell|bell|knock|baby|crying|cry|cough|scream|shout|yell|glass|breaking|smoke|fire|beep|ringing|phone|dog|bark|cat|meow|gunshot|explosion|whistle)\b/i;
+const AMBIENT_TRIVIAL = /\b(trivial|silence|silent|background|fan|typing|keyboard|breathing|traffic|hum|wind|nothing notable|no(?:thing)? sound|just (?:silence|background|noise))\b/i;
+
+function _currentAmbientLevel() {
+  if (!analyser || !dataArray) return 0;
+  analyser.getByteFrequencyData(dataArray);
+  let sum = 0;
+  for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+  return sum / dataArray.length;
+}
+
+function _updateBaseline(level) {
+  AMBIENT.baselineSamples.push(level);
+  if (AMBIENT.baselineSamples.length > AMBIENT.baselineWindow) AMBIENT.baselineSamples.shift();
+  const sorted = [...AMBIENT.baselineSamples].sort((a, b) => a - b);
+  // Median is more robust than mean against the spike itself.
+  AMBIENT.baselineRms = sorted[Math.floor(sorted.length / 2)] || 0;
+}
+
+// Record N ms of audio off the existing global mic stream. Returns base64 webm.
+function recordAmbientChunk(durationMs) {
+  return new Promise((resolve, reject) => {
+    const stream = window.globalMicStream;
+    if (!stream) return reject(new Error('No global mic stream available'));
+    let mimeType = 'audio/webm;codecs=opus';
+    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/webm';
+    const recorder = new MediaRecorder(stream, { mimeType });
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = async () => {
+      try {
+        const blob = new Blob(chunks, { type: mimeType });
+        const buf = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        resolve({ base64: btoa(bin), bytes: bytes.length, format: 'webm' });
+      } catch (e) { reject(e); }
+    };
+    recorder.onerror = (e) => reject(e.error || new Error('recorder error'));
+    recorder.start();
+    setTimeout(() => { try { recorder.stop(); } catch (_) {} }, durationMs);
+  });
+}
+
+// Pull the model's structured "FINAL: <label>" out of either content or reasoning_content.
+function _extractFinalLabel(reply) {
+  if (!reply) return '';
+  const matches = [...reply.matchAll(/FINAL\s*:\s*([^\n."]+)/gi)];
+  if (matches.length) return matches[matches.length - 1][1].trim().replace(/[.\s]+$/, '');
+  return reply.split('\n')[0].trim().replace(/[.\s]+$/, '');
+}
+
+async function classifyAmbient(durationMs = AMBIENT.recordingMs, customPrompt) {
+  const captured = await recordAmbientChunk(durationMs);
+  const prompt = customPrompt || (
+    'Listen to the audio. Identify the dominant sound in 1-4 words. ' +
+    'Output ONLY a single line: FINAL: <label>. ' +
+    'Examples: FINAL: doorbell · FINAL: alarm beep · FINAL: baby crying · FINAL: breaking glass · FINAL: dog barking · FINAL: phone ringing · FINAL: music · FINAL: speech. ' +
+    'If background/silence/typing/fan/traffic, output exactly: FINAL: TRIVIAL'
+  );
+  const result = await window.assistant.nimAudio({
+    prompt,
+    audioBase64: captured.base64,
+    format: captured.format,
+    max_tokens: 1200,
+  });
+  if (!result.success) throw new Error(result.error || 'no audio reply');
+  const label = _extractFinalLabel(result.reply);
+  return { label, latencyMs: result.latencyMs, model: result.model, bytes: captured.bytes, raw: result.reply };
+}
+
+async function _onAmbientSpike(level) {
+  if (AMBIENT.busy) return;
+  if (Date.now() - AMBIENT.lastAlertAt < AMBIENT.cooldownMs) return;
+  AMBIENT.busy = true;
+  try {
+    console.log(`[Ambient] 🔊 Spike detected (level=${level.toFixed(1)} baseline=${AMBIENT.baselineRms.toFixed(1)}). Capturing...`);
+    const { label, latencyMs } = await classifyAmbient();
+    console.log(`[Ambient] 🎧 ${latencyMs}ms → "${label}"`);
+    if (!label) return;
+    if (/^TRIVIAL$/i.test(label)) return;
+    if (AMBIENT_TRIVIAL.test(label) && !AMBIENT_NOTEWORTHY.test(label)) return;
+    if (label.length > 80) return; // model went off the rails
+
+    AMBIENT.lastAlertAt = Date.now();
+    const alert = `Sir, I'm detecting ${label.replace(/^(it sounds like|it appears to be|the sound is|this is|sounds like)\s+/i, '')}.`;
+    jarvisTextEl.textContent = alert;
+    speakTTS(alert);
+    rememberAsync('ambient', `Heard: ${label}`, { spikeLevel: level });
+  } catch (e) {
+    console.warn('[Ambient] Spike handling failed:', e.message);
+  } finally {
+    AMBIENT.busy = false;
+  }
+}
+
+function startAmbientListening() {
+  if (AMBIENT.enabled) return false;
+  if (!analyser || !window.globalMicStream) {
+    console.warn('[Ambient] Mic / analyser not ready yet.');
+    return false;
+  }
+  AMBIENT.enabled = true;
+  AMBIENT.baselineSamples = [];
+  AMBIENT.lastAlertAt = 0;
+  console.log('[Ambient] 👂 Ambient listening ON');
+  AMBIENT.pollHandle = setInterval(() => {
+    if (!AMBIENT.enabled) return;
+    if (isUserSpeaking || isSpeaking) return; // don't classify our own / user voice
+    const level = _currentAmbientLevel();
+    _updateBaseline(level);
+    if (AMBIENT.baselineSamples.length < 8) return; // warm-up
+    const delta = level - AMBIENT.baselineRms;
+    if (level > AMBIENT.spikeFloor && delta > AMBIENT.spikeDelta) {
+      _onAmbientSpike(level);
+    }
+  }, 250);
+  return true;
+}
+
+function stopAmbientListening() {
+  if (!AMBIENT.enabled) return false;
+  AMBIENT.enabled = false;
+  if (AMBIENT.pollHandle) clearInterval(AMBIENT.pollHandle);
+  AMBIENT.pollHandle = null;
+  console.log('[Ambient] 👂 Ambient listening OFF');
+  return true;
+}
+
+// One-shot: record 3s right now and tell the user what we hear.
+async function whatDoYouHear() {
+  if (AMBIENT.oneShotInflight) return;
+  AMBIENT.oneShotInflight = true;
+  isProcessing = true;
+  ignoreAudio = true;
+  updateStatus('PROCESSING');
+  speakFiller('Tuning my ears, sir.');
+  try {
+    const { label, latencyMs } = await classifyAmbient(3000,
+      'Listen to the audio clip. Identify what you hear in 2-8 words. ' +
+      'Output ONLY a single line: FINAL: <description>. ' +
+      'If it is mostly silence or background, output: FINAL: mostly silence');
+    console.log(`[Ambient] one-shot ${latencyMs}ms: ${label}`);
+    const reply = label
+      ? `I hear ${label.replace(/^(it sounds like|i hear|it seems|sounds like)\s+/i, '')}.`
+      : 'I cannot make out anything distinctive at the moment, sir.';
+    conversationHistory.push({ role: 'user', content: '[ambient:listen]' });
+    conversationHistory.push({ role: 'assistant', content: reply });
+    handleAIResponse(reply);
+  } catch (err) {
+    const msg = `I couldn't make out the audio, sir. ${err.message}`;
+    jarvisTextEl.textContent = msg;
+    speakTTS(msg);
+    finishSpeakingState();
+  } finally {
+    AMBIENT.oneShotInflight = false;
+  }
+}
+
+window.jarvisAmbient = { start: startAmbientListening, stop: stopAmbientListening, whatDoYouHear, classifyAmbient, AMBIENT };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SENSORY MEMORY (Phase 4) — embed observations, recall on demand
+// ═══════════════════════════════════════════════════════════════════════════
+// Fire-and-forget memory writer. We deliberately don't await — embedding takes
+// a few hundred ms and we don't want to slow the UX.
+function rememberAsync(type, text, meta) {
+  if (!text || typeof text !== 'string' || text.trim().length < 3) return;
+  window.assistant.memoryAdd({ type, text, meta }).then(r => {
+    if (r && r.success) console.log(`[Memory+] ${type} #${r.id} (total ${r.count}): ${text.substring(0, 60)}`);
+    else console.warn('[Memory+] add failed:', r && r.error);
+  }).catch(err => console.warn('[Memory+] add error:', err.message));
+}
+
+// Recall intent: "what was I doing earlier", "do you remember", "what was on my screen X minutes ago",
+// "what did we talk about", "what was that sound earlier".
+function detectRecallIntent(text) {
+  const t = text.toLowerCase().trim();
+  if (/\b(do you remember|recall|earlier|previously|a (?:few |couple of )?(?:minutes|hours) ago|just now|a moment ago|some time ago|before|last time)\b/.test(t)
+      && /\b(what|when|where|who|how|why|did i|was i|were we|tell me|show me|did we|talk|discuss|hear|see|look|on (?:my|the) screen|sound|noise|happen)\b/.test(t)) {
+    return { recall: true, query: text };
+  }
+  if (/\b(what (?:was|were) (?:on (?:my|the) screen|i (?:doing|working on)|that))\b/.test(t)) return { recall: true, query: text };
+  if (/\b(memory stats|what do you remember|what's in your memory)\b/.test(t)) return { recall: 'stats' };
+  return null;
+}
+
+// Compose a RAG context block from memory hits.
+function _formatRecallContext(hits) {
+  if (!hits || !hits.length) return null;
+  const lines = hits.map(h => {
+    const ago = h.ageSec < 60 ? `${h.ageSec}s ago`
+              : h.ageSec < 3600 ? `${Math.round(h.ageSec / 60)}m ago`
+              : `${Math.round(h.ageSec / 3600)}h ago`;
+    return `• [${h.type}, ${ago}, sim=${h.sim}] ${h.text}`;
+  });
+  return `Relevant prior observations from sensory memory:\n${lines.join('\n')}`;
+}
+
+async function runRecall(userText) {
+  isProcessing = true;
+  ignoreAudio = true;
+  updateStatus('PROCESSING');
+  speakFiller('Searching memory, sir.');
+  try {
+    const res = await window.assistant.memoryQuery({ query: userText, k: 5, minScore: 0.1 });
+    if (!res.success) throw new Error(res.error || 'memory query failed');
+
+    const ctx = _formatRecallContext(res.hits);
+    if (!ctx) {
+      const reply = "I have no record of anything matching that, sir.";
+      conversationHistory.push({ role: 'user', content: userText });
+      conversationHistory.push({ role: 'assistant', content: reply });
+      handleAIResponse(reply);
+      return;
+    }
+
+    // RAG: feed memory context to the brain so it can synthesize a reply.
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: ctx },
+      { role: 'user', content: userText },
+    ];
+    const llm = await window.assistant.nimChat({ messages, max_tokens: 350 });
+    const reply = (llm.success && llm.reply) ? llm.reply : `Here's what I have, sir:\n${res.hits.map(h => '• ' + h.text).join('\n')}`;
+    conversationHistory.push({ role: 'user', content: userText });
+    conversationHistory.push({ role: 'assistant', content: reply });
+    handleAIResponse(reply);
+  } catch (err) {
+    console.error('[Recall] Error:', err);
+    const msg = `My memory subsystem appears unreachable, sir. ${err.message}`;
+    jarvisTextEl.textContent = msg;
+    speakTTS(msg);
+    finishSpeakingState();
+  }
+}
+
+async function speakMemoryStats() {
+  const s = await window.assistant.memoryStats();
+  const parts = Object.entries(s.byType || {}).map(([k, v]) => `${v} ${k}`);
+  const reply = s.count
+    ? `My sensory memory holds ${s.count} entries — ${parts.join(', ')}.`
+    : 'My sensory memory is empty, sir.';
+  isProcessing = true;
+  conversationHistory.push({ role: 'assistant', content: reply });
+  handleAIResponse(reply);
+}
+
+window.jarvisMemory = { remember: rememberAsync, recall: runRecall, stats: speakMemoryStats };
+
 async function processInput(text) {
   if (isProcessing) {
     console.warn("[LLM] Already processing. Ignoring input.");
     return;
   }
-  
+
   console.log(`[LLM] Processing Input: "${text}"`);
   if (!text.trim() || text.length < 2) {
     console.warn("[LLM] Terminating: Empty or trivial text.");
+    return;
+  }
+
+  // ── RECALL INTENT (sensory memory RAG) ──
+  const recall = detectRecallIntent(text);
+  if (recall) {
+    cmdsExecuted++;
+    cmdsPillCount.textContent = cmdsExecuted;
+    if (recall.recall === 'stats') { speakMemoryStats(); return; }
+    await runRecall(text);
+    return;
+  }
+
+  // ── SENSORY INTENT (vision / camera / ambient / toggles) ──
+  const intent = detectVisionIntent(text);
+  if (intent) {
+    if (intent.source === 'control') {
+      let reply;
+      switch (intent.op) {
+        case 'watch-start':   reply = startScreenWatch(30) ? 'Continuous screen monitoring engaged, sir.' : 'I am already watching your screen, sir.'; break;
+        case 'watch-stop':    reply = stopScreenWatch() ? 'Screen monitoring disengaged.' : 'Screen monitoring was not active, sir.'; break;
+        case 'ambient-start': reply = startAmbientListening() ? 'Ambient listening online — I will alert you to anything notable.' : 'Ambient listening is already active, sir.'; break;
+        case 'ambient-stop':  reply = stopAmbientListening() ? 'Ambient listening disengaged, sir.' : 'Ambient listening was not active, sir.'; break;
+        default:              reply = 'Acknowledged, sir.';
+      }
+      conversationHistory.push({ role: 'user', content: text });
+      conversationHistory.push({ role: 'assistant', content: reply });
+      isProcessing = true;
+      handleAIResponse(reply);
+      return;
+    }
+    if (intent.source === 'ambient') {
+      cmdsExecuted++;
+      cmdsPillCount.textContent = cmdsExecuted;
+      await whatDoYouHear();
+      return;
+    }
+    cmdsExecuted++;
+    cmdsPillCount.textContent = cmdsExecuted;
+    await runVisionQuery({ source: intent.source, prompt: intent.prompt });
     return;
   }
 
@@ -1213,8 +1749,22 @@ async function processInput(text) {
       }
     }
 
-    // ── STEP 2: CONVERSATIONAL RESPONSE (Gemini Flash) ──
-    // If no tool was detected, use Gemini Flash (lowest latency + smart)
+    // ── STEP 2: CONVERSATIONAL RESPONSE (NVIDIA NIM — primary brain) ──
+    const nimMessages = [{ role: 'system', content: SYSTEM_PROMPT }, ...orMessages];
+    const nimResult = await window.assistant.nimChat({ messages: nimMessages })
+      .catch(err => ({ success: false, error: err.message }));
+
+    if (nimResult.success && nimResult.reply) {
+      const reply = nimResult.reply;
+      console.log(`[LLM] NIM (${nimResult.model}) ${nimResult.latencyMs}ms: ${reply.substring(0, 100)}...`);
+      conversationHistory.push({ role: 'assistant', content: reply });
+      rememberAsync('conversation', `User: ${text}\nJarvis: ${reply}`);
+      handleAIResponse(reply);
+      return;
+    }
+    console.warn(`[LLM] NIM failed (${nimResult.error}), falling back to Gemini.`);
+
+    // ── STEP 3: FALLBACK (Gemini Flash) ──
     const geminiResult = await window.assistant.geminiChat(orMessages)
       .catch(err => ({ success: false, error: err.message }));
 
@@ -1226,7 +1776,7 @@ async function processInput(text) {
       return;
     }
 
-    // ── STEP 3: FALLBACK (OpenRouter/Gemma) ──
+    // ── STEP 4: FALLBACK (OpenRouter/Gemma) ──
     const orResult = await window.assistant.openRouterChat({ messages: orMessages, useReasoning: false });
     if (orResult.success && orResult.reply) {
       handleAIResponse(orResult.reply);
@@ -1400,40 +1950,27 @@ async function speakGroqTTS(text) {
   }
 }
 
-function speakWebTTS(text) {
+async function speakWebTTS(text) {
   window.lastSpokenText = text;
   window.speechSynthesis.cancel();
 
   const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = 0.95;
-  utt.pitch = 0.85;
+  utt.rate = 1.0;
+  utt.pitch = 1.0;
 
-  const voices = window.speechSynthesis.getVoices();
-  console.log(`[TTS] Available voices: ${voices.length}`);
-  
-  const v = voices.find(x => x.name.includes('Daniel') || x.name.includes('Microsoft George') || x.name.includes('Samantha'))
-    || voices.find(x => x.lang.startsWith('en-GB'))
-    || voices.find(x => x.lang.startsWith('en-US'));
-
-  if (v) {
-    console.log(`[TTS] Selected Voice: ${v.name}`);
-    utt.voice = v;
-  } else {
-    console.warn("[TTS] No matching voice found, using system default.");
-  }
+  const v = await pickVoice();
+  if (v) utt.voice = v;
+  else console.warn('[TTS] No matching voice found, using system default.');
 
   utt.onstart = () => {
-    console.log("[TTS] Speech Started.");
+    console.log('[TTS] Speech Started.');
     isSpeaking = true;
     ignoreAudio = true;
     updateStatus('SPEAKING');
   };
 
   utt.onend = finishSpeakingState;
-
-  utt.onerror = () => {
-    finishSpeakingState();
-  };
+  utt.onerror = () => finishSpeakingState();
 
   window.speechSynthesis.speak(utt);
 }
